@@ -1,0 +1,553 @@
+diff --git a/apps/openmw/mwrender/localmap.cpp b/apps/openmw/mwrender/localmap.cpp
+index 02f59e0ed027d3359dd240b919f691f976aecc20..4718da98ac3d80e72e7c03d8b7caa4fcfb835987 100644
+--- a/apps/openmw/mwrender/localmap.cpp
++++ b/apps/openmw/mwrender/localmap.cpp
+@@ -190,6 +190,7 @@ osg::ref_ptr<osg::Camera> LocalMap::createOrthographicCamera(float x, float y, f
+     camera->setClearColor(osg::Vec4(0.f, 0.f, 0.f, 1.f));
+     camera->setClearMask(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+     camera->setRenderOrder(osg::Camera::PRE_RENDER);
++    camera->setCullingMode(osg::CullSettings::VIEW_FRUSTUM_SIDES_CULLING);
+ 
+     camera->setCullMask(Mask_Scene | Mask_SimpleWater | Mask_Terrain | Mask_Object | Mask_Static);
+     camera->setNodeMask(Mask_RenderToTexture);
+diff --git a/apps/openmw/mwrender/objects.cpp b/apps/openmw/mwrender/objects.cpp
+index ec1c4397bfd1d1f831852c22c0f86e8fbc6253ae..6aeb12f0c5f40f47576e711fa10d887532b2be30 100644
+--- a/apps/openmw/mwrender/objects.cpp
++++ b/apps/openmw/mwrender/objects.cpp
+@@ -1,5 +1,7 @@
+ #include "objects.hpp"
+ 
++#include <osgUtil/CullVisitor>
++
+ #include <osg/Group>
+ #include <osg/UserDataContainer>
+ 
+@@ -14,6 +16,21 @@
+ #include "creatureanimation.hpp"
+ #include "vismask.hpp"
+ 
++class OcclusionActivateCallback : public osg::NodeCallback
++{
++public:
++    virtual void operator()(osg::Node* node, osg::NodeVisitor* nv)
++    {
++        osgUtil::CullVisitor* cv = static_cast<osgUtil::CullVisitor*>(nv);
++        if (cv->getCullingMode() & osg::CullSettings::SHADOW_OCCLUSION_CULLING)
++            cv->pushCullingSet();
++
++        traverse(node, nv);
++
++        if (cv->getCullingMode() & osg::CullSettings::SHADOW_OCCLUSION_CULLING)
++            cv->popCullingSet();
++    }
++};
+ 
+ namespace MWRender
+ {
+@@ -44,6 +61,7 @@ void Objects::insertBegin(const MWWorld::Ptr& ptr)
+     if (found == mCellSceneNodes.end())
+     {
+         cellnode = new osg::Group;
++        cellnode->addCullCallback(new OcclusionActivateCallback);
+         cellnode->setName("Cell Root");
+         mRootNode->addChild(cellnode);
+         mCellSceneNodes[ptr.getCell()] = cellnode;
+@@ -183,6 +201,8 @@ void Objects::updatePtr(const MWWorld::Ptr &old, const MWWorld::Ptr &cur)
+     osg::Group* cellnode;
+     if(mCellSceneNodes.find(newCell) == mCellSceneNodes.end()) {
+         cellnode = new osg::Group;
++        cellnode->addCullCallback(new OcclusionActivateCallback);
++        cellnode->setName("Cell Root");
+         mRootNode->addChild(cellnode);
+         mCellSceneNodes[newCell] = cellnode;
+     } else {
+diff --git a/apps/openmw/mwrender/renderingmanager.cpp b/apps/openmw/mwrender/renderingmanager.cpp
+index 56d3ba4a43229a075c09d702110c1059122d91e7..40756f3aa8c413b720a730a5ea8df399e9f050e3 100644
+--- a/apps/openmw/mwrender/renderingmanager.cpp
++++ b/apps/openmw/mwrender/renderingmanager.cpp
+@@ -370,6 +370,9 @@ namespace MWRender
+         const bool useTerrainNormalMaps = Settings::Manager::getBool("auto use terrain normal maps", "Shaders");
+         const bool useTerrainSpecularMaps = Settings::Manager::getBool("auto use terrain specular maps", "Shaders");
+ 
++        mSky.reset(new SkyManager(sceneRoot, resourceSystem->getSceneManager()));
++        mSky->setCamera(mViewer->getCamera());
++
+         mTerrainStorage.reset(new TerrainStorage(mResourceSystem, normalMapPattern, heightMapPattern, useTerrainNormalMaps, specularMapPattern, useTerrainSpecularMaps));
+         const float lodFactor = Settings::Manager::getFloat("lod factor", "Terrain");
+ 
+@@ -387,6 +390,7 @@ namespace MWRender
+             mTerrain.reset(new Terrain::QuadTreeWorld(
+                 sceneRoot, mRootNode, mResourceSystem, mTerrainStorage.get(), Mask_Terrain, Mask_PreCompile, Mask_Debug,
+                 compMapResolution, compMapLevel, lodFactor, vertexLodMod, maxCompGeometrySize));
++            static_cast<Terrain::QuadTreeWorld*>(mTerrain.get())->setOcclusionCullingSettings(Settings::Manager::getBool("debug occlusion culling", "Terrain"), Settings::Manager::getInt("occlusion culling maximum active", "Terrain"), Settings::Manager::getFloat("occlusion culling minimum volume", "Terrain"), Settings::Manager::getFloat("occlusion culling zfactor", "Terrain"), Settings::Manager::getFloat("occlusion culling zbias", "Terrain"));
+             if (Settings::Manager::getBool("object paging", "Terrain"))
+             {
+                 mObjectPaging.reset(new ObjectPaging(mResourceSystem->getSceneManager()));
+@@ -465,13 +469,13 @@ namespace MWRender
+ 
+         mFog.reset(new FogManager());
+ 
+-        mSky.reset(new SkyManager(sceneRoot, resourceSystem->getSceneManager()));
+-        mSky->setCamera(mViewer->getCamera());
+-
+         source->setStateSetModes(*mRootNode->getOrCreateStateSet(), osg::StateAttribute::ON);
+ 
+         osg::Camera::CullingMode cullingMode = osg::Camera::DEFAULT_CULLING|osg::Camera::FAR_PLANE_CULLING;
+ 
++        if (!Settings::Manager::getBool("occlusion culling", "Terrain"))
++            cullingMode &= ~(osg::CullStack::SHADOW_OCCLUSION_CULLING);
++
+         if (!Settings::Manager::getBool("small feature culling", "Camera"))
+             cullingMode &= ~(osg::CullStack::SMALL_FEATURE_CULLING);
+         else
+diff --git a/apps/openmw/mwrender/water.cpp b/apps/openmw/mwrender/water.cpp
+index 7a8677e43a487a9db30a92b7290e7c23b8a035d6..d820a7737fbc9c1c55c4516a25bc4c1b63b24947 100644
+--- a/apps/openmw/mwrender/water.cpp
++++ b/apps/openmw/mwrender/water.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <iomanip>
+ 
++#include <osg/PolygonMode>
+ #include <osg/Fog>
+ #include <osg/Depth>
+ #include <osg/Group>
+@@ -280,6 +281,16 @@ public:
+         camera->addCullCallback(new InheritViewPointCallback);
+         camera->setComputeNearFarMode(osg::CullSettings::DO_NOT_COMPUTE_NEAR_FAR);
+ 
++        osg::Camera::CullingMode cullingMode = osg::Camera::DEFAULT_CULLING|osg::Camera::FAR_PLANE_CULLING;
++        cullingMode &= ~(osg::CullStack::SHADOW_OCCLUSION_CULLING);
++
++        if (!Settings::Manager::getBool("small feature culling", "Camera"))
++            cullingMode &= ~(osg::CullStack::SMALL_FEATURE_CULLING);
++        else
++        {
++            cullingMode |= osg::CullStack::SMALL_FEATURE_CULLING;
++        }
++        camera->setCullingMode(cullingMode);
+         camera->setCullMask(Mask_Effect | Mask_Scene | Mask_Object | Mask_Static | Mask_Terrain | Mask_Actor | Mask_ParticleSystem | Mask_Sky | Mask_Sun | Mask_Player | Mask_Lighting | Mask_Groundcover);
+ 
+         // No need for fog here, we are already applying fog on the water surface itself as well as underwater fog
+@@ -344,6 +355,17 @@ public:
+         camera->setSmallFeatureCullingPixelSize(Settings::Manager::getInt("small feature culling pixel size", "Water"));
+         camera->setName("ReflectionCamera");
+         camera->addCullCallback(new InheritViewPointCallback);
++        osg::Camera::CullingMode cullingMode = osg::Camera::DEFAULT_CULLING|osg::Camera::FAR_PLANE_CULLING;
++        if (!Settings::Manager::getBool("reflection occlusion culling", "Terrain"))
++            cullingMode &= ~(osg::CullStack::SHADOW_OCCLUSION_CULLING);
++
++        if (!Settings::Manager::getBool("small feature culling", "Camera"))
++            cullingMode &= ~(osg::CullStack::SMALL_FEATURE_CULLING);
++        else
++        {
++            cullingMode |= osg::CullStack::SMALL_FEATURE_CULLING;
++        }
++        camera->setCullingMode(cullingMode);
+ 
+         // XXX: should really flip the FrontFace on each renderable instead of forcing clockwise.
+         osg::ref_ptr<osg::FrontFace> frontFace(new osg::FrontFace);
+diff --git a/components/sceneutil/mwshadowtechnique.cpp b/components/sceneutil/mwshadowtechnique.cpp
+index 95ff8f2b016052f7a8aa3950cd252bc3706c4c9e..98d27d20425eaff23445a3cd80a18d8874106b60 100644
+--- a/components/sceneutil/mwshadowtechnique.cpp
++++ b/components/sceneutil/mwshadowtechnique.cpp
+@@ -588,6 +588,7 @@ MWShadowTechnique::ShadowData::ShadowData(MWShadowTechnique::ViewDependentData*
+ 
+     // switch off small feature culling as this can cull out geometry that will still be large enough once perspective correction takes effect.
+     _camera->setCullingMode(_camera->getCullingMode() & ~osg::CullSettings::SMALL_FEATURE_CULLING);
++    _camera->setCullingMode(_camera->getCullingMode() & ~osg::CullSettings::SHADOW_OCCLUSION_CULLING);
+ 
+     // set viewport
+     _camera->setViewport(0,0,textureSize.x(),textureSize.y());
+diff --git a/components/terrain/chunkmanager.cpp b/components/terrain/chunkmanager.cpp
+index 7a6d4fdb0a80a86b5680e4c778f775001e536d27..7158d343f568cff561cc3ceca5b35ef417e880e4 100644
+--- a/components/terrain/chunkmanager.cpp
++++ b/components/terrain/chunkmanager.cpp
+@@ -238,6 +238,8 @@ osg::ref_ptr<osg::Node> ChunkManager::createChunk(float chunkSize, const osg::Ve
+     }
+     geometry->setNodeMask(mNodeMask);
+ 
++    geometry->createOccluders(chunkCenter * mStorage->getCellWorldSize());
++
+     if (mDebugChunks)
+     {
+         osg::ref_ptr<osg::Group> result(new osg::Group);
+diff --git a/components/terrain/quadtreeworld.cpp b/components/terrain/quadtreeworld.cpp
+index bbf212942ec54275423fadf1f150137e9c28d628..e2f8b8b861b5d3e04ddc7c2a33cb822cc104f484 100644
+--- a/components/terrain/quadtreeworld.cpp
++++ b/components/terrain/quadtreeworld.cpp
+@@ -3,6 +3,7 @@
+ #include <osgUtil/CullVisitor>
+ #include <osg/ShapeDrawable>
+ #include <osg/PolygonMode>
++#include <osg/Material>
+ 
+ #include <limits>
+ #include <sstream>
+@@ -247,6 +248,9 @@ private:
+ QuadTreeWorld::QuadTreeWorld(osg::Group *parent, osg::Group *compileRoot, Resource::ResourceSystem *resourceSystem, Storage *storage, unsigned int nodeMask, unsigned int preCompileMask, unsigned int borderMask, int compMapResolution, float compMapLevel, float lodFactor, int vertexLodMod, float maxCompGeometrySize)
+     : TerrainGrid(parent, compileRoot, resourceSystem, storage, nodeMask, preCompileMask, borderMask)
+     , mViewDataMap(new ViewDataMap)
++    , mDebugOccluders(false)
++    , mOcclusionCullingZFactor(0)
++    , mOcclusionCullingZBias(0)
+     , mQuadTreeBuilt(false)
+     , mLodFactor(lodFactor)
+     , mVertexLodMod(vertexLodMod)
+@@ -258,12 +262,88 @@ QuadTreeWorld::QuadTreeWorld(osg::Group *parent, osg::Group *compileRoot, Resour
+     mChunkManager->setCompositeMapLevel(compMapLevel);
+     mChunkManager->setMaxCompositeGeometrySize(maxCompGeometrySize);
+     mChunkManagers.push_back(mChunkManager.get());
++
++    mCollectOccludersVisitor = new osg::CollectOccludersVisitor;
++}
++
++void QuadTreeWorld::setOcclusionCullingSettings(bool debug, int maximumActive, float minimumVolume, float zfactor, float zbias)
++{
++    if (debug)
++    {
++        mTerrainRoot->getOrCreateStateSet()->setAttributeAndModes(new osg::PolygonMode(osg::PolygonMode::FRONT_AND_BACK, osg::PolygonMode::LINE), osg::StateAttribute::ON);
++        mDebugOccluders = true;
++    }
++    mCollectOccludersVisitor->setMaximumNumberOfActiveOccluders(maximumActive);
++    mCollectOccludersVisitor->setMinimumShadowOccluderVolume(minimumVolume);
++    mOcclusionCullingZFactor = zfactor;
++    mOcclusionCullingZBias = zbias;
+ }
+ 
+ QuadTreeWorld::~QuadTreeWorld()
+ {
+ }
+ 
++void collectOccluders(osg::CollectOccludersVisitor* mCollectOccludersVisitor, osgUtil::CullVisitor* cv, ViewData* vd, bool debug, float zfactor, float zbias)
++{
++    mCollectOccludersVisitor->inheritCullSettings(*cv);
++    mCollectOccludersVisitor->reset();
++    mCollectOccludersVisitor->pushViewport(cv->getViewport());
++    mCollectOccludersVisitor->pushProjectionMatrix(cv->getProjectionMatrix());
++    mCollectOccludersVisitor->pushModelViewMatrix(cv->getModelViewMatrix(),osg::Transform::ABSOLUTE_RF);
++
++    for (unsigned int i=0; i<vd->getNumEntries(); ++i)
++    {
++        ViewData::Entry& entry = vd->getEntry(i);
++        TerrainDrawable* drw = static_cast<TerrainDrawable*>(entry.mRenderingNode->asGroup()->getChild(0));
++
++        float zheight = (drw->getBoundingBox()._min.z() + 1);
++        if (zheight > 0)
++        {
++            float cuttoff = zheight * zfactor + zbias;
++            if (cv->getEyePoint().z() - drw->getBoundingBox()._min.z() > cuttoff)
++                continue;
++        }
++
++        if (debug)
++            drw->getOccluders()->accept(*cv);
++
++        drw->getOccluders()->accept(*mCollectOccludersVisitor);
++    }
++
++    mCollectOccludersVisitor->popModelViewMatrix();
++    mCollectOccludersVisitor->popProjectionMatrix();
++    mCollectOccludersVisitor->popViewport();
++
++    mCollectOccludersVisitor->removeOccludedOccluders();
++
++    if (debug)
++    {
++        static osg::ref_ptr<osg::StateSet> red = nullptr;
++        if (!red) { red = new osg::StateSet;
++        osg::Material* m = new osg::Material;
++        m->setEmission(osg::Material::FRONT_AND_BACK, osg::Vec4f(0,1,0,1));
++        m->setDiffuse(osg::Material::FRONT_AND_BACK, osg::Vec4f(0,0,0,1));
++        m->setAmbient(osg::Material::FRONT_AND_BACK, osg::Vec4f(0,0,0,1));
++        red->setAttributeAndModes(m, osg::StateAttribute::ON|osg::StateAttribute::OVERRIDE);
++        red->setMode(GL_DEPTH_TEST, osg::StateAttribute::OFF);
++        }
++        cv->pushStateSet(red);
++        for (auto svo : mCollectOccludersVisitor->getCollectedOccluderSet())
++        {
++            const osg::NodePath& path = svo.getNodePath();
++            osg::OccluderNode* ocn = static_cast<osg::OccluderNode*>(path.back());
++            ocn->accept(*cv);
++        }
++        cv->popStateSet();
++    }
++
++    if (debug && cv->getTraversalNumber()%50==0)
++        OSG_NOTICE << mCollectOccludersVisitor->getCollectedOccluderSet().size() << " occluders for " << cv->getCurrentCamera()->getName() << std::endl;
++
++    for (auto svo : mCollectOccludersVisitor->getCollectedOccluderSet())
++        cv->getProjectionCullingStack().back().addOccluder(svo);
++}
++
+ /// get the level of vertex detail to render this node at, expressed relative to the native resolution of the data set.
+ unsigned int getVertexLod(QuadTreeNode* node, int vertexLodMod)
+ {
+@@ -363,8 +443,6 @@ void updateWaterCullingView(HeightCullCallback* callback, ViewData* vd, osgUtil:
+         callback->setLowZ(-std::numeric_limits<float>::max());
+         return;
+     }
+-    cv->pushCurrentMask();
+-    static bool debug = getenv("OPENMW_WATER_CULLING_DEBUG") != nullptr;
+     for (unsigned int i=0; i<vd->getNumEntries(); ++i)
+     {
+         ViewData::Entry& entry = vd->getEntry(i);
+@@ -383,7 +461,7 @@ void updateWaterCullingView(HeightCullCallback* callback, ViewData* vd, osgUtil:
+             continue;
+         lowZ = bb._min.z();
+ 
+-        if (!debug)
++        if (!debugTerrainChunk)
+             break;
+         osg::Box* b = new osg::Box;
+         b->set(bb.center(), bb._max - bb.center());
+@@ -406,13 +484,12 @@ void updateWaterCullingView(HeightCullCallback* callback, ViewData* vd, osgUtil:
+         drw->accept(*cv);
+     }
+     callback->setLowZ(lowZ);
+-    cv->popCurrentMask();
+ }
+ 
+ void QuadTreeWorld::accept(osg::NodeVisitor &nv)
+ {
+-    bool isCullVisitor = nv.getVisitorType() == osg::NodeVisitor::CULL_VISITOR;
+-    if (!isCullVisitor && nv.getVisitorType() != osg::NodeVisitor::INTERSECTION_VISITOR)
++    osgUtil::CullVisitor* cv = nv.getVisitorType() == osg::NodeVisitor::CULL_VISITOR ? static_cast<osgUtil::CullVisitor*>(&nv) : nullptr;
++    if (!cv && nv.getVisitorType() != osg::NodeVisitor::INTERSECTION_VISITOR)
+     {
+         if (nv.getName().find("AcceptedByComponentsTerrainQuadTreeWorld") != std::string::npos)
+         {
+@@ -427,7 +504,7 @@ void QuadTreeWorld::accept(osg::NodeVisitor &nv)
+         return;
+     }
+ 
+-    osg::Object * viewer = isCullVisitor ? static_cast<osgUtil::CullVisitor*>(&nv)->getCurrentCamera() : nullptr;
++    osg::Object * viewer = cv ? cv->getCurrentCamera() : nullptr;
+     bool needsUpdate = true;
+     ViewData *vd = mViewDataMap->getViewData(viewer, nv.getViewPoint(), mActiveGrid, needsUpdate);
+ 
+@@ -444,12 +521,26 @@ void QuadTreeWorld::accept(osg::NodeVisitor &nv)
+     {
+         ViewData::Entry& entry = vd->getEntry(i);
+         loadRenderingNode(entry, vd, mVertexLodMod, cellWorldSize, mActiveGrid, mChunkManagers, false, mViewDataMap->getReuseDistance());
+-        entry.mRenderingNode->accept(nv);
+     }
+ 
+-    if (mHeightCullCallback && isCullVisitor)
++    if (cv && cv->getCullingMode() & osg::CullStack::SHADOW_OCCLUSION_CULLING)
++    {
++        collectOccluders(mCollectOccludersVisitor, cv, vd, mDebugOccluders, mOcclusionCullingZFactor, mOcclusionCullingZBias);
++        cv->pushCullingSet();
++    }
++
++    if (cv)
+         updateWaterCullingView(mHeightCullCallback, vd, static_cast<osgUtil::CullVisitor*>(&nv), mStorage->getCellWorldSize(), !isGridEmpty(), mDebugTerrainChunks);
+ 
++    for (unsigned int i=0; i<vd->getNumEntries(); ++i)
++    {
++        ViewData::Entry& entry = vd->getEntry(i);
++        entry.mRenderingNode->accept(nv);
++    }
++
++    if (cv && cv->getCullingMode() & osg::CullStack::SHADOW_OCCLUSION_CULLING)
++        cv->popCullingSet();
++
+     vd->markUnchanged();
+ 
+     double referenceTime = nv.getFrameStamp() ? nv.getFrameStamp()->getReferenceTime() : 0.0;
+diff --git a/components/terrain/quadtreeworld.hpp b/components/terrain/quadtreeworld.hpp
+index f7cbf8097a6a840c39bb01a50a980c8b745ee7c9..e0c731a27514038605c618b59135b4f0cae191e9 100644
+--- a/components/terrain/quadtreeworld.hpp
++++ b/components/terrain/quadtreeworld.hpp
+@@ -9,6 +9,7 @@
+ namespace osg
+ {
+     class NodeVisitor;
++    class CollectOccludersVisitor;
+ }
+ 
+ namespace Terrain
+@@ -24,6 +25,8 @@ namespace Terrain
+ 
+         ~QuadTreeWorld();
+ 
++        void setOcclusionCullingSettings(bool debug, int maximumActive, float minimumVolume, float zfactor, float zbias);
++
+         void accept(osg::NodeVisitor& nv);
+ 
+         void enable(bool enabled) override;
+@@ -67,6 +70,12 @@ namespace Terrain
+         std::vector<ChunkManager*> mChunkManagers;
+ 
+         std::mutex mQuadTreeMutex;
++
++        osg::ref_ptr<osg::CollectOccludersVisitor> mCollectOccludersVisitor;
++
++        bool mDebugOccluders;
++        float mOcclusionCullingZFactor;
++        float mOcclusionCullingZBias;
+         bool mQuadTreeBuilt;
+         float mLodFactor;
+         int mVertexLodMod;
+diff --git a/components/terrain/terraindrawable.cpp b/components/terrain/terraindrawable.cpp
+index 746534abb46b0a93b2afb1bf2c66e431fc2d3a71..88aaa641f698e1115b76fc579c71f4f551ab66a4 100644
+--- a/components/terrain/terraindrawable.cpp
++++ b/components/terrain/terraindrawable.cpp
+@@ -2,6 +2,8 @@
+ 
+ #include <osg/ClusterCullingCallback>
+ #include <osgUtil/CullVisitor>
++#include <osg/OccluderNode>
++#include <osg/Material>
+ 
+ #include <components/sceneutil/lightmanager.hpp>
+ 
+@@ -164,5 +166,95 @@ void TerrainDrawable::compileGLObjects(osg::RenderInfo &renderInfo) const
+     osg::Geometry::compileGLObjects(renderInfo);
+ }
+ 
++osg::OccluderNode* createOccluder(const osg::Vec3& v1,const osg::Vec3& v2,const osg::Vec3& v3,const osg::Vec3& v4)
++{
++    osg::ConvexPlanarOccluder* cpo = new osg::ConvexPlanarOccluder;
++    osg::ConvexPlanarPolygon& occluder = cpo->getOccluder();
++    occluder.add(v1);
++    occluder.add(v2);
++    occluder.add(v3);
++    occluder.add(v4);
++    osg::OccluderNode* occluderNode = new osg::OccluderNode;
++    occluderNode->setOccluder(cpo);
++
++    osg::Geometry* debug = new osg::Geometry;
++    osg::Vec3Array* coords = new osg::Vec3Array(occluder.getVertexList().begin(),occluder.getVertexList().end());
++    debug->setVertexArray(coords);
++    debug->setCullingActive(false);
++    debug->addPrimitiveSet(new osg::DrawArrays(osg::PrimitiveSet::QUADS,0,4));
++    static osg::ref_ptr<osg::StateSet> stateset = nullptr;
++    if (!stateset){ stateset = new osg::StateSet;
++    stateset->setMode(GL_CULL_FACE, osg::StateAttribute::OFF);
++    osg::Material* m = new osg::Material;
++    m->setEmission(osg::Material::FRONT_AND_BACK, osg::Vec4f(1,0,0,1));
++      m->setDiffuse(osg::Material::FRONT_AND_BACK, osg::Vec4f(0,0,0,1));
++        m->setAmbient(osg::Material::FRONT_AND_BACK, osg::Vec4f(0,0,0,1));
++        stateset->setAttributeAndModes(m, osg::StateAttribute::ON);
++        stateset->setRenderBinDetails(100,"RenderBin");
++    }
++    debug->setStateSet(stateset);
++
++    occluderNode->addChild(debug);
++
++    return occluderNode;
++}
++
++void TerrainDrawable::createOccluders(const osg::Vec2f& offset)
++{
++    mOccluders = new osg::Group;
++
++    const osg::BoundingBox& mybb = getBoundingBox();
++    const float epsilon = 0.001f;
++    float minz = mybb._min.z() - epsilon;
++    if (minz <= -1) return;
++
++    osg::BoundingBox bb;
++    bb._min = osg::Vec3f(mybb._min.x()+offset.x(), mybb._min.y()+offset.y(), -1);
++    bb._max = osg::Vec3f(mybb._max.x()+offset.x(), mybb._max.y()+offset.y(), minz);
++
++    // bottom side
++    mOccluders->addChild(createOccluder(bb.corner(0),
++                                    bb.corner(2),
++                                    bb.corner(3),
++                                    bb.corner(1)));
++
++    const float sandwichfactor = 0.1;
++    if ((bb._max.z() - bb._min.z()) / (bb._max.x() - bb._min.x()) < sandwichfactor)
++        return;
++
++    // front side
++    mOccluders->addChild(createOccluder(bb.corner(0),
++                                  bb.corner(1),
++                                  bb.corner(5),
++                                  bb.corner(4)));
++    // right side
++    mOccluders->addChild(createOccluder(bb.corner(1),
++                                   bb.corner(3),
++                                  bb.corner(7),
++                                  bb.corner(5)));
++   // left side
++   mOccluders->addChild(createOccluder(bb.corner(2),
++                                  bb.corner(0),
++                                  bb.corner(4),
++                                   bb.corner(6)));
++   // back side
++   mOccluders->addChild(createOccluder(bb.corner(3),
++                                  bb.corner(2),
++                                   bb.corner(6),
++                                  bb.corner(7)));
++
++    // top side
++    mOccluders->addChild(createOccluder(bb.corner(6),
++                                    bb.corner(4),
++                                    bb.corner(5),
++                                    bb.corner(7)));
++
++}
++
++osg::Group* TerrainDrawable::getOccluders()
++{
++    return mOccluders.get();
++}
++
+ }
+ 
+diff --git a/components/terrain/terraindrawable.hpp b/components/terrain/terraindrawable.hpp
+index dbfdd3c80a8bb9692b2bc2bf45c9760e53cc2a35..7fc78a20a8924592d25c9e1ee040907ff0e542ce 100644
+--- a/components/terrain/terraindrawable.hpp
++++ b/components/terrain/terraindrawable.hpp
+@@ -58,6 +58,9 @@ namespace Terrain
+         void setCompositeMap(CompositeMap* map) { mCompositeMap = map; }
+         void setCompositeMapRenderer(CompositeMapRenderer* renderer) { mCompositeMapRenderer = renderer; }
+ 
++        void createOccluders(const osg::Vec2f& offset);
++        osg::Group* getOccluders();
++
+     private:
+         osg::BoundingBox mWaterBoundingBox;
+         PassVector mPasses;
+@@ -67,6 +70,8 @@ namespace Terrain
+         osg::ref_ptr<SceneUtil::LightListCallback> mLightListCallback;
+         osg::ref_ptr<CompositeMap> mCompositeMap;
+         osg::ref_ptr<CompositeMapRenderer> mCompositeMapRenderer;
++
++        osg::ref_ptr<osg::Group> mOccluders;
+     };
+ 
+ }
+diff --git a/files/settings-default.cfg b/files/settings-default.cfg
+index 08039f5fbee07b596629a8fd0560b279df53f028..3b002f0c2a77743d026d393cb0f2eee6f1c1ecba 100644
+--- a/files/settings-default.cfg
++++ b/files/settings-default.cfg
+@@ -163,6 +163,25 @@ object paging min size cost multiplier = 25
+ # Assign a random color to merged batches.
+ object paging debug batches = false
+ 
++# Terrain occlusion culling for main camera
++occlusion culling = true
++
++# Terrain occlusion culling for reflection camera
++reflection occlusion culling = true
++
++# Maximum number of active terrain occluders
++occlusion culling maximum active = 5
++
++# Minimum screen volume ratio for terrain occluders
++occlusion culling minimum volume = 0.05
++
++# Occluders "occluder height * zfactor + zbias" units below the camera will not be used
++occlusion culling zfactor = 3
++occlusion culling zbias = 100
++
++# Visualize occluders (red), active occluders (green), water occludees (blue) and wireframe terrain
++debug occlusion culling = false
++
+ [Fog]
+ 
+ # If true, use extended fog parameters for distant terrain not controlled by
